@@ -13,12 +13,24 @@ use crate::lock_file::lock_file_satisfies_project;
 use rattler::install::Transaction;
 use rattler_conda_types::{Platform, PrefixRecord, RepoDataRecord};
 use rattler_lock::{CondaLock, LockedDependency};
+use rip::types::Artifact;
 use rip::{
-    tags::WheelTag, Artifact, ArtifactHashes, ArtifactInfo, ArtifactName, Distribution,
-    InstallPaths, NormalizedPackageName, PackageDb, UnpackWheelOptions, Wheel, WheelFilename,
+    artifacts::{
+        wheel::{InstallPaths, UnpackWheelOptions},
+        Wheel,
+    },
+    index::PackageDb,
+    python_env::{find_distributions_in_venv, uninstall_distribution, Distribution, WheelTag},
+    types::{
+        ArtifactHashes, ArtifactInfo, ArtifactName, Extra, NormalizedPackageName, WheelFilename,
+    },
 };
+use std::collections::HashSet;
 use std::{io::ErrorKind, path::Path, str::FromStr, time::Duration};
 use tokio::task::JoinError;
+
+/// The installer name for pypi packages installed by pixi.
+const PIXI_PYPI_INSTALLER: &str = env!("CARGO_PKG_NAME");
 
 /// Verify the location of the prefix folder is not changed so the applied prefix path is still valid.
 /// Errors when there is a file system error or the path does not align with the defined prefix.
@@ -213,7 +225,7 @@ async fn update_python_distributions(
     );
 
     // Determine the current python distributions in those locations
-    let current_python_packages = rip::find_distributions_in_venv(prefix.root(), &install_paths)
+    let current_python_packages = find_distributions_in_venv(prefix.root(), &install_paths)
         .into_diagnostic()
         .context(
             "failed to locate python packages that have not been installed as conda packages",
@@ -244,33 +256,18 @@ async fn update_python_distributions(
         let site_package_path = install_paths.site_packages();
 
         for python_distribution in python_distributions_to_remove {
-            tracing::info!(
-                "uninstalling python package {}-{}",
-                &python_distribution.name,
-                &python_distribution.version
-            );
-            let relative_dist_info = python_distribution
-                .dist_info
-                .strip_prefix(site_package_path)
-                .expect("the dist-info path must be a sub-path of the site-packages path");
-            rip::uninstall::uninstall_distribution(&prefix.root().join(site_package_path), relative_dist_info)
-                .into_diagnostic()
-                .with_context(|| format!("could not uninstall python package {}-{}. Manually remove the `.pixi/env` folder and try again.", &python_distribution.name, &python_distribution.version))?;
-
-            // HACK: Also remove the HASH file that pixi writes. Ignore the error if its there. We
-            // should probably actually add this file to the RECORD.
-            let _ = std::fs::remove_file(
-                prefix
-                    .root()
-                    .join(&python_distribution.dist_info)
-                    .join("HASH"),
-            );
+            uninstall_pixi_installed_distribution(prefix, site_package_path, &python_distribution)?;
         }
     }
 
     // Install the individual python packages that we want
-    let package_install_pb =
-        install_python_distributions(prefix, install_paths, package_stream).await?;
+    let package_install_pb = install_python_distributions(
+        prefix,
+        install_paths,
+        &prefix.root().join(&python_info.path),
+        package_stream,
+    )
+    .await?;
 
     // Clear any pending progress bar
     for pb in package_install_pb
@@ -287,7 +284,8 @@ async fn update_python_distributions(
 async fn install_python_distributions(
     prefix: &Prefix,
     install_paths: InstallPaths,
-    package_stream: impl Stream<Item = miette::Result<(Option<String>, Wheel)>> + Sized,
+    python_executable_path: &Path,
+    package_stream: impl Stream<Item = miette::Result<(Option<String>, HashSet<Extra>, Wheel)>> + Sized,
 ) -> miette::Result<Option<ProgressBar>> {
     // Determine the number of packages that we are going to install
     let len = {
@@ -310,11 +308,12 @@ async fn install_python_distributions(
     // Concurrently unpack the wheels as they become available in the stream.
     let install_pb = pb.clone();
     package_stream
-        .try_for_each_concurrent(Some(20), move |(hash, wheel)| {
+        .try_for_each_concurrent(Some(20), move |(hash, extras, wheel)| {
             let install_paths = install_paths.clone();
             let root = prefix.root().to_path_buf();
             let message_formatter = message_formatter.clone();
             let pb = install_pb.clone();
+            let python_executable_path = python_executable_path.to_owned();
             async move {
                 let pb_task = message_formatter.start(wheel.name().to_string()).await;
                 let unpack_result = tokio::task::spawn_blocking(move || {
@@ -322,8 +321,11 @@ async fn install_python_distributions(
                         .unpack(
                             &root,
                             &install_paths,
+                            &python_executable_path,
                             &UnpackWheelOptions {
-                                installer: Some(env!("CARGO_PKG_NAME").into()),
+                                installer: Some(PIXI_PYPI_INSTALLER.into()),
+                                extras: Some(extras),
+                                ..Default::default()
                             },
                         )
                         .into_diagnostic()
@@ -364,7 +366,7 @@ fn stream_python_artifacts<'a>(
     package_db: &'a PackageDb,
     packages_to_download: Vec<&'a LockedDependency>,
 ) -> (
-    impl Stream<Item = miette::Result<(Option<String>, Wheel)>> + 'a,
+    impl Stream<Item = miette::Result<(Option<String>, HashSet<Extra>, Wheel)>> + 'a,
     Option<ProgressBar>,
 ) {
     if packages_to_download.is_empty() {
@@ -448,7 +450,15 @@ fn stream_python_artifacts<'a>(
                     .and_then(|h| h.sha256())
                     .map(|sha256| format!("sha256-{:x}", sha256));
 
-                Ok((hash, wheel))
+                Ok((
+                    hash,
+                    pip_package
+                        .extras
+                        .iter()
+                        .filter_map(|e| Extra::from_str(e).ok())
+                        .collect(),
+                    wheel,
+                ))
             }
         })
         .buffer_unordered(20)
@@ -483,7 +493,7 @@ fn remove_old_python_distributions(
     let install_paths = InstallPaths::for_venv(python_version, platform.is_windows());
 
     // Locate the packages that are installed in the previous environment
-    let current_python_packages = rip::find_distributions_in_venv(prefix.root(), &install_paths)
+    let current_python_packages = find_distributions_in_venv(prefix.root(), &install_paths)
         .into_diagnostic()
         .with_context(|| format!("failed to determine the python packages installed for a previous version of python ({}.{})", python_version.0, python_version.1))?
         .into_iter().filter(|d| d.installer.as_deref() != Some("conda") && d.installer.is_some()).collect_vec();
@@ -497,31 +507,42 @@ fn remove_old_python_distributions(
     // Remove the python packages
     let site_package_path = install_paths.site_packages();
     for python_package in current_python_packages {
-        tracing::info!(
-            "uninstalling python package from previous python version {}-{}",
-            &python_package.name,
-            &python_package.version
-        );
-
         pb.set_message(format!(
             "{} {}",
             &python_package.name, &python_package.version
         ));
 
-        let relative_dist_info = python_package
-            .dist_info
-            .strip_prefix(site_package_path)
-            .expect("the dist-info path must be a sub-path of the site-packages path");
-        rip::uninstall::uninstall_distribution(&prefix.root().join(site_package_path), relative_dist_info)
-            .into_diagnostic()
-            .with_context(|| format!("could not uninstall python package {}-{}. Manually remove the `.pixi/env` folder and try again.", &python_package.name, &python_package.version))?;
-
-        // HACK: Also remove the HASH file that pixi writes. Ignore the error if its there. We
-        // should probably actually add this file to the RECORD.
-        let _ = std::fs::remove_file(prefix.root().join(&python_package.dist_info).join("HASH"));
+        uninstall_pixi_installed_distribution(prefix, site_package_path, &python_package)?;
 
         pb.inc(1);
     }
+
+    Ok(())
+}
+
+/// Uninstalls a python distribution that was previously installed by pixi.
+fn uninstall_pixi_installed_distribution(
+    prefix: &Prefix,
+    site_package_path: &Path,
+    python_package: &Distribution,
+) -> miette::Result<()> {
+    tracing::info!(
+        "uninstalling python package {}-{}",
+        &python_package.name,
+        &python_package.version
+    );
+    let relative_dist_info = python_package
+        .dist_info
+        .strip_prefix(site_package_path)
+        .expect("the dist-info path must be a sub-path of the site-packages path");
+
+    // HACK: Also remove the HASH file that pixi writes. Ignore the error if its there. We
+    // should probably actually add this file to the RECORD.
+    let _ = std::fs::remove_file(prefix.root().join(&python_package.dist_info).join("HASH"));
+
+    uninstall_distribution(&prefix.root().join(site_package_path), relative_dist_info)
+        .into_diagnostic()
+        .with_context(|| format!("could not uninstall python package {}-{}. Manually remove the `.pixi/env` folder and try again.", &python_package.name, &python_package.version))?;
 
     Ok(())
 }
@@ -562,8 +583,8 @@ fn determine_python_distributions_to_remove_and_install<'p>(
             desired_python_packages.remove(found_desired_packages_idx);
             false
         } else {
-            // If this package was installed as a conda package we should not remove it.
-            current_python_packages.installer.as_deref() != Some("conda")
+            // Only if this package was previously installed by us do we remove it.
+            current_python_packages.installer.as_deref() == Some(PIXI_PYPI_INSTALLER)
         }
     });
 

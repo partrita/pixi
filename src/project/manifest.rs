@@ -70,7 +70,7 @@ pub struct ProjectManifest {
 
     /// Optional python requirements
     #[serde(default, rename = "pypi-dependencies")]
-    pub pypi_dependencies: Option<IndexMap<rip::PackageName, PyPiRequirement>>,
+    pub pypi_dependencies: Option<IndexMap<rip::types::PackageName, PyPiRequirement>>,
 }
 
 impl ProjectManifest {
@@ -143,6 +143,65 @@ impl ProjectManifest {
                     self.build_dependencies.insert(IndexMap::new())
                 }
             }
+        }
+    }
+
+    /// Remove dependency given a `SpecType`.
+    pub fn remove_dependency(
+        &mut self,
+        dep: &str,
+        spec_type: &SpecType,
+    ) -> miette::Result<(String, NamelessMatchSpec)> {
+        let dependencies = match spec_type {
+            SpecType::Run => Some(&mut self.dependencies),
+            SpecType::Build => self.build_dependencies.as_mut(),
+            SpecType::Host => self.host_dependencies.as_mut(),
+        };
+
+        if let Some(deps) = dependencies {
+            deps.shift_remove_entry(dep).ok_or(miette::miette!(
+                "Couldn't find {} in [{}]",
+                console::style(dep).bold(),
+                console::style(spec_type.name()).bold(),
+            ))
+        } else {
+            Err(miette::miette!(
+                "[{}] doesn't exist",
+                console::style(spec_type.name()).bold()
+            ))
+        }
+    }
+
+    /// Remove a dependency for a `Platform`.
+    pub fn remove_target_dependency(
+        &mut self,
+        dep: &str,
+        spec_type: &SpecType,
+        platform: &Platform,
+    ) -> miette::Result<(String, NamelessMatchSpec)> {
+        let target = PixiSpanned::from(TargetSelector::Platform(*platform));
+        let target_metadata = self.target.get_mut(&target).ok_or(miette::miette!(
+            "Platform: {} is not configured for this project",
+            console::style(platform.as_str()).bold(),
+        ))?;
+
+        let dependencies = match spec_type {
+            SpecType::Run => Some(&mut target_metadata.dependencies),
+            SpecType::Build => target_metadata.build_dependencies.as_mut(),
+            SpecType::Host => target_metadata.host_dependencies.as_mut(),
+        };
+
+        if let Some(deps) = dependencies {
+            deps.shift_remove_entry(dep).ok_or(miette::miette!(
+                "Couldn't find {} in [{}]",
+                console::style(dep).bold(),
+                console::style(format!("target.{}.{}", platform.as_str(), spec_type.name())).bold(),
+            ))
+        } else {
+            Err(miette::miette!(
+                "[{}] doesn't exist",
+                console::style(format!("target.{}.{}", platform.as_str(), spec_type.name())).bold(),
+            ))
         }
     }
 }
